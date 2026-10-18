@@ -14,6 +14,9 @@ npm install
 npm start          # listens on :6447, auto-spawns `opencode serve`
 ```
 
+Works with **opencode v1 and v2** — the server API generation is detected
+automatically at startup (`/api/info` for v2, `/provider` for v1).
+
 API keys live in `api-keys.json` (auto-generated on first run if missing).
 
 ## Endpoints
@@ -44,25 +47,11 @@ curl http://localhost:6447/v1/messages \
 
 - Multi-turn: send header `x-oc-session: <name>` (or OpenAI `user` field /
   Anthropic `metadata.user_id`) to pin a conversation. Without a key, each
-  request is self-contained (full history replayed as a transcript) and the
-  temporary opencode session is deleted as soon as the reply is in — the
-  local opencode DB never accumulates junk sessions.
-- The key pins a session **per key, not per conversation**: `user` /
-  `metadata.user_id` are usually one app-wide ID, so every chat from the same
-  frontend would collapse into a single opencode session. Pass a distinct
-  `x-oc-session` value per conversation instead.
-- Keyed sessions are held in memory only — restarting the proxy starts those
-  conversations over. Stateless (key-less) requests are unaffected.
-- Request sampling params (`temperature`, `max_tokens`) are not forwarded;
-  opencode uses its own agent/model config.
-- Streaming is **real**: `stream: true` forwards `message.part.delta` from
-  opencode's `/event` SSE as tokens arrive, while the blocking prompt call is
-  still running. Reasoning is emitted as `reasoning_content` (OpenAI) /
-  `thinking` blocks (Anthropic) only when the model actually produces it; if
-  no delta shows up it falls back to emitting the buffered reply in one burst.
+  request is self-contained (full history replayed as a transcript).
 - Client-supplied `tools` schemas are **not** forwarded — the opencode agent
   runs its own built-in tools (read/edit/bash) in `./oc-workspace` and folds
   results into the reply text.
+- Streaming is buffered (the local API returns the final message, not tokens).
 
 ## Environment
 

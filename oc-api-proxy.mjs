@@ -5,6 +5,11 @@
 // spoofing no longer works. This proxy drives the real binary's local
 // `opencode serve` API, so upstream calls are made by the genuine client.
 //
+// Works with both opencode v1 and v2 server APIs; the generation is detected
+// at startup. v2 turn: POST /api/session → /api/session/:id/prompt →
+// /api/experimental/session/:id/wait → GET /api/session/:id/message.
+// v1 turn: POST /session → POST /session/:id/message (already synchronous).
+//
 // Usage:
 //   node oc-api-proxy.mjs                 # auto-spawns `opencode serve`
 //   OC_SERVER=http://127.0.0.1:13284 \    # or use an already-running server
@@ -23,12 +28,7 @@
 //   - Send header `x-oc-session: <name>` (or OpenAI `user` field, or
 //     Anthropic metadata.user_id) to get a persistent multi-turn conversation.
 //   - Without a key, every request is a fresh self-contained session whose
-//     full message history is replayed as a transcript. That session is
-//     deleted right after the reply so the opencode DB never fills up.
-//
-// Streaming: with stream=true we tap opencode's `GET /event` SSE and forward
-//   `message.part.delta` as tokens while the blocking prompt call is still
-//   running. If no delta ever shows up we fall back to the buffered reply.
+//     full message history is replayed as a transcript.
 //
 // Limitation: client-supplied `tools` schemas are not forwarded; the opencode
 // agent runs its own built-in tools (read/edit/bash) server-side and folds
@@ -88,6 +88,32 @@ function auth(req) {
 // ── opencode serve backend ──────────────────────────────────────────
 let ocBase = null;
 let ocAuth = null;
+let apiVersion = null; // "v1" | "v2", detected at startup
+
+// Probe which server API generation this opencode is serving. v2 answers
+// /api/info with a version; v1 has no /api/* routes but returns its provider
+// list at /provider. (Unknown paths may answer 200 with HTML, so each probe
+// must validate the JSON shape, not just the status code.)
+async function detectApi() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const v2 = await ocReq("GET", "/api/info");
+      if (v2.status === 200 && v2.json?.version) {
+        apiVersion = "v2";
+        console.log(`[OC] opencode v2 API detected (v${v2.json.version})`);
+        return;
+      }
+      const v1 = await ocReq("GET", "/provider");
+      if (v1.status === 200 && v1.json?.all) {
+        apiVersion = "v1";
+        console.log("[OC] opencode v1 API detected");
+        return;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error("opencode serve did not become healthy");
+}
 
 function ocReq(method, pathname, body) {
   return new Promise((resolve, reject) => {
@@ -129,6 +155,7 @@ async function startBackend() {
     ocAuth = OC_PASSWORD
       ? "Basic " + Buffer.from(`${OC_USERNAME}:${OC_PASSWORD}`).toString("base64")
       : null;
+    await detectApi();
     return;
   }
   if (OC_BIN === "opencode" && !fs.existsSync("/usr/bin/opencode")) {
@@ -148,6 +175,7 @@ async function startBackend() {
   });
   child.on("exit", (code) => console.log("[OC] opencode serve exited with code", code));
   process.on("exit", () => { try { child.kill("SIGKILL"); } catch {} });
+  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
 
   const port = await new Promise((resolve, reject) => {
     let buf = "";
@@ -164,25 +192,30 @@ async function startBackend() {
   ocBase = `http://127.0.0.1:${port}`;
   ocAuth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
   console.log(`[OC] opencode serve backend on ${ocBase}`);
-
-  for (let i = 0; i < 60; i++) {
-    try {
-      const r = await ocReq("GET", "/provider");
-      if (r.status === 200) return;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw new Error("opencode serve did not become healthy");
+  await detectApi();
 }
 
 // ── models ──────────────────────────────────────────────────────────
 let modelCache = null;
 async function getModels() {
   if (modelCache) return modelCache;
-  const r = await ocReq("GET", "/provider");
-  if (r.status !== 200 || !r.json?.all) throw new Error("failed to list opencode providers");
-  const oc = r.json.all.find((p) => p.id === "opencode");
-  modelCache = oc ? Object.keys(oc.models || {}) : [];
+  if (apiVersion === "v2") {
+    const r = await ocReq("GET", "/api/model");
+    const all = r.status === 200 ? r.json?.data : null;
+    if (!Array.isArray(all)) throw new Error("failed to list opencode models");
+    modelCache = [
+      ...new Set(
+        all
+          .filter((m) => m.providerID === "opencode" && m.enabled !== false)
+          .map((m) => m.modelID || m.id)
+      ),
+    ];
+  } else {
+    const r = await ocReq("GET", "/provider");
+    if (r.status !== 200 || !r.json?.all) throw new Error("failed to list opencode providers");
+    const oc = r.json.all.find((p) => p.id === "opencode");
+    modelCache = oc ? Object.keys(oc.models || {}) : [];
+  }
   if (!modelCache.length) throw new Error("no opencode models found");
   return modelCache;
 }
@@ -226,9 +259,9 @@ function anthropicToPrompt(body) {
 }
 
 // ── sessions ────────────────────────────────────────────────────────
-const sessions = new Map(); // key -> { sessionID, turns, chain }
+const sessions = new Map(); // key -> { sessionID, modelId, turns, chain }
 function sessionEntry(key) {
-  if (!sessions.has(key)) sessions.set(key, { sessionID: null, turns: 0, chain: Promise.resolve() });
+  if (!sessions.has(key)) sessions.set(key, { sessionID: null, modelId: null, turns: 0, chain: Promise.resolve() });
   return sessions.get(key);
 }
 
@@ -243,27 +276,76 @@ function upstreamError(r) {
   return err;
 }
 
-async function ask({ key, system, modelId, transcript, lastUserText, onSession }) {
-  const model = { modelID: modelId, providerID: "opencode" };
+// Model reference differs between API generations:
+// v2 `{ providerID, id }` (set on the session), v1 `{ modelID, providerID }` (per message).
+const modelRef = (modelId) =>
+  apiVersion === "v2"
+    ? { providerID: "opencode", id: modelId }
+    : { modelID: modelId, providerID: "opencode" };
+
+async function createSession(modelId) {
+  if (apiVersion === "v2") {
+    const r = await ocReq("POST", "/api/session", { model: modelRef(modelId) });
+    if (r.status !== 200 || !r.json?.data?.id) throw upstreamError(r);
+    return r.json.data.id;
+  }
+  const r = await ocReq("POST", "/session", {});
+  if (r.status !== 200 || !r.json?.id) throw upstreamError(r);
+  return r.json.id;
+}
+
+async function switchSessionModel(sessionID, modelId) {
+  if (apiVersion !== "v2") return; // v1 takes the model on every message
+  const r = await ocReq("POST", `/api/session/${sessionID}/model`, { model: modelRef(modelId) });
+  if (r.status !== 200 && r.status !== 204) throw upstreamError(r);
+}
+
+function deleteSession(sessionID) {
+  const path = apiVersion === "v2" ? `/api/session/${sessionID}` : `/session/${sessionID}`;
+  ocReq("DELETE", path).catch(() => {});
+}
+
+// One synchronous-looking turn on the v2 API: admit the prompt, wait for the
+// agent loop to go idle, then read the newest assistant message back.
+async function runTurn(sessionID, { system, modelId, text }) {
+  if (apiVersion === "v2") {
+    // v2 prompts have no `system` field — fold it into the prompt text
+    const t = system ? `${system}\n\n${text}` : text;
+    const p = await ocReq("POST", `/api/session/${sessionID}/prompt`, { text: t });
+    if (p.status !== 200) throw upstreamError(p);
+    const w = await ocReq("POST", `/api/experimental/session/${sessionID}/wait`);
+    if (w.status !== 204 && w.status !== 200) throw upstreamError(w);
+    const r = await ocReq("GET", `/api/session/${sessionID}/message?order=desc&limit=5`);
+    const messages = r.status === 200 && Array.isArray(r.json?.data) ? r.json.data : null;
+    if (!messages) throw upstreamError(r);
+    const idle = messages.find((m) => m.type === "idle");
+    if (idle?.outcome === "failed") {
+      const err = new Error(idle.error?.message || "opencode agent run failed");
+      err.status = idle.error?.status === 429 ? 429 : 502;
+      throw err;
+    }
+    const assistant = messages.find((m) => m.type === "assistant");
+    if (!assistant) throw new Error("empty response from opencode");
+    return extractMessageV2(assistant);
+  }
+  // v1: a single synchronous message call
+  const r = await ocReq("POST", `/session/${sessionID}/message`, {
+    ...(system ? { system } : {}),
+    model: modelRef(modelId),
+    parts: [{ type: "text", text }],
+  });
+  if (r.status !== 200) throw upstreamError(r);
+  return extractMessageV1(r.json);
+}
+
+async function ask({ key, system, modelId, transcript, lastUserText }) {
   if (!key) {
-    // stateless: fresh session, replay the whole transcript for context.
-    // the session exists only to serve this one request, so it is deleted as
-    // soon as the reply is in hand — only ever the id created in this call,
-    // keyed sessions and pre-existing ones are never touched.
-    const created = await ocReq("POST", "/session", {});
-    if (created.status !== 200) throw upstreamError(created);
-    const sid = created.json.id;
-    onSession?.(sid);
+    // stateless: fresh session, replay the whole transcript for context
+    const sessionID = await createSession(modelId);
     try {
-      return await ocReq("POST", `/session/${sid}/message`, {
-        ...(system ? { system } : {}),
-        model,
-        parts: [{ type: "text", text: transcript || lastUserText }],
-      });
+      return await runTurn(sessionID, { system, modelId, text: transcript || lastUserText });
     } finally {
-      ocReq("DELETE", `/session/${sid}`).catch((e) =>
-        console.log(`[OC] temp session ${sid} not deleted:`, e.message)
-      );
+      deleteSession(sessionID);
     }
   }
   // stateful: pin one opencode session per key; first turn replays the
@@ -271,26 +353,40 @@ async function ask({ key, system, modelId, transcript, lastUserText, onSession }
   const entry = sessionEntry(key);
   const run = entry.chain.then(async () => {
     if (!entry.sessionID) {
-      const created = await ocReq("POST", "/session", {});
-      if (created.status !== 200) throw upstreamError(created);
-      entry.sessionID = created.json.id;
+      entry.sessionID = await createSession(modelId);
+      entry.modelId = modelId;
       entry.turns = 0;
+    } else if (entry.modelId !== modelId) {
+      await switchSessionModel(entry.sessionID, modelId);
+      entry.modelId = modelId;
     }
-    onSession?.(entry.sessionID);
     const text = entry.turns === 0 ? (transcript || lastUserText) : lastUserText;
     entry.turns++;
-    return ocReq("POST", `/session/${entry.sessionID}/message`, {
-      ...(system ? { system } : {}),
-      model,
-      parts: [{ type: "text", text }],
-    });
+    return runTurn(entry.sessionID, { system, modelId, text });
   });
   entry.chain = run.catch(() => {});
   return run;
 }
 
 // ── translation: opencode message → chat formats ────────────────────
-function extractMessage(message) {
+function extractMessageV2(message) {
+  let text = "";
+  let reasoning = "";
+  for (const p of message?.content || []) {
+    if (p.type === "text") text += p.text ?? "";
+    else if (p.type === "reasoning") reasoning += p.text ?? "";
+  }
+  const tokens = message?.tokens || {};
+  return {
+    text,
+    reasoning,
+    inputTokens: tokens.input ?? 0,
+    outputTokens: tokens.output ?? 0,
+    finish: message?.finish,
+  };
+}
+
+function extractMessageV1(message) {
   let text = "";
   let reasoning = "";
   for (const p of message?.parts || []) {
@@ -338,69 +434,26 @@ function openaiResponse(modelId, r) {
   };
 }
 
-function writeSafe(res, s) {
-  if (res.writableEnded || res.destroyed) return false;
-  try { return res.write(s); } catch { return false; }
-}
-
-function sseHead(res) {
+function openaiStream(res, modelId, r) {
+  const id = rid("chatcmpl-");
+  const created = Math.floor(Date.now() / 1000);
+  const chunk = (delta, finish) =>
+    `data: ${JSON.stringify({
+      id, object: "chat.completion.chunk", created, model: modelId,
+      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    })}\n\n`;
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
-}
-
-function openaiSink(res, modelId) {
-  const id = rid("chatcmpl-");
-  const created = Math.floor(Date.now() / 1000);
-  let opened = false;
-  let sentText = "";
-  let sentReasoning = "";
-  const chunk = (delta, finish, usage) =>
-    `data: ${JSON.stringify({
-      id, object: "chat.completion.chunk", created, model: modelId,
-      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
-      ...(usage ? { usage } : {}),
-    })}\n\n`;
-  const open = () => {
-    if (opened) return true;
-    if (res.writableEnded || res.destroyed) return false;
-    opened = true;
-    sseHead(res);
-    writeSafe(res, chunk({ role: "assistant" }));
-    return true;
-  };
-  const rest = (full, sent) => (!sent ? full || "" : full && full.startsWith(sent) ? full.slice(sent.length) : "");
-  return {
-    get opened() { return opened; },
-    delta(kind, text) {
-      if (!open()) return;
-      if (kind === "reasoning") { sentReasoning += text; writeSafe(res, chunk({ reasoning_content: text })); }
-      else { sentText += text; writeSafe(res, chunk({ content: text })); }
-    },
-    finish(r) {
-      if (!open()) return;
-      const reasoning = rest(r.reasoning, sentReasoning);
-      const text = rest(r.text, sentText);
-      if (reasoning) writeSafe(res, chunk({ reasoning_content: reasoning }));
-      if (text) writeSafe(res, chunk({ content: text }));
-      writeSafe(res, chunk({}, mapFinish(r.finish), {
-        prompt_tokens: r.inputTokens,
-        completion_tokens: r.outputTokens,
-        total_tokens: r.inputTokens + r.outputTokens,
-      }));
-      writeSafe(res, "data: [DONE]\n\n");
-      try { res.end(); } catch {}
-    },
-    fail(message) {
-      if (!open()) return;
-      writeSafe(res, `data: ${JSON.stringify({ error: { message } })}\n\n`);
-      writeSafe(res, "data: [DONE]\n\n");
-      try { res.end(); } catch {}
-    },
-  };
+  res.write(chunk({ role: "assistant" }));
+  if (r.reasoning) res.write(chunk({ reasoning_content: r.reasoning }));
+  if (r.text) res.write(chunk({ content: r.text }));
+  res.write(chunk({}, mapFinish(r.finish)));
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
 function anthropicResponse(modelId, r) {
@@ -415,140 +468,32 @@ function anthropicResponse(modelId, r) {
   };
 }
 
-function anthropicSink(res, modelId) {
+function anthropicStream(res, modelId, r) {
   const id = rid("msg_");
-  let opened = false;
-  let block = null;
-  let index = -1;
-  let sentText = "";
-  let sentReasoning = "";
-  const send = (event, data) => writeSafe(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  const openBlock = (type) => {
-    if (block === type) return;
-    if (block) send("content_block_stop", { type: "content_block_stop", index });
-    index += 1;
-    block = type;
-    send("content_block_start", {
-      type: "content_block_start",
-      index,
-      content_block: type === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" },
-    });
-  };
-  const open = () => {
-    if (opened) return true;
-    if (res.writableEnded || res.destroyed) return false;
-    opened = true;
-    sseHead(res);
-    send("message_start", {
-      type: "message_start",
-      message: {
-        id, type: "message", role: "assistant", content: [], model: modelId,
-        stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    });
-    return true;
-  };
-  const rest = (full, sent) => (!sent ? full || "" : full && full.startsWith(sent) ? full.slice(sent.length) : "");
-  const emit = (type, text) => {
-    openBlock(type);
-    send("content_block_delta", {
-      type: "content_block_delta",
-      index,
-      delta: type === "thinking" ? { type: "thinking_delta", thinking: text } : { type: "text_delta", text },
-    });
-  };
-  return {
-    get opened() { return opened; },
-    delta(kind, text) {
-      if (!open()) return;
-      if (kind === "reasoning") { sentReasoning += text; emit("thinking", text); }
-      else { sentText += text; emit("text", text); }
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  send("message_start", {
+    type: "message_start",
+    message: {
+      id, type: "message", role: "assistant", content: [], model: modelId,
+      stop_reason: null, usage: { input_tokens: r.inputTokens, output_tokens: 0 },
     },
-    finish(r) {
-      if (!open()) return;
-      const reasoning = rest(r.reasoning, sentReasoning);
-      const text = rest(r.text, sentText);
-      if (reasoning) { sentReasoning += reasoning; emit("thinking", reasoning); }
-      if (text) { sentText += text; emit("text", text); }
-      if (block) send("content_block_stop", { type: "content_block_stop", index });
-      send("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: r.finish === "length" ? "max_tokens" : "end_turn" },
-        usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
-      });
-      send("message_stop", { type: "message_stop" });
-      try { res.end(); } catch {}
-    },
-    fail(message) {
-      if (!open()) return;
-      send("error", { type: "error", error: { type: "api_error", message } });
-      try { res.end(); } catch {}
-    },
-  };
-}
-
-// ── live deltas: opencode's SSE /event ─────────────────────────────
-// POST /session/{id}/message blocks until the run finishes, but /event
-// emits `message.part.delta` while it is still generating — tap it to
-// forward real tokens. Deltas carry only a partID, so part types are
-// tracked from `message.part.updated` to tell reasoning from content.
-// If no delta ever shows up the sink falls back to the buffered reply.
-function connectEvents(watch) {
-  let req = null;
-  let done = false;
-  let buf = "";
-  const close = () => {
-    if (done) return;
-    done = true;
-    try { req?.destroy(); } catch {}
-  };
-  const onFrame = (frame) => {
-    const line = frame.split("\n").find((l) => l.startsWith("data:"));
-    if (!line) return;
-    let ev;
-    try { ev = JSON.parse(line.slice(5)); } catch { return; }
-    const p = ev.properties || {};
-    if (!watch.sid || p.sessionID !== watch.sid) return;
-    if (ev.type === "message.part.updated" && p.part && p.part.id) {
-      watch.types.set(p.part.id, p.part.type);
-    } else if (ev.type === "message.part.delta" && typeof p.delta === "string" && p.delta) {
-      const kind = watch.types.get(p.partID) === "reasoning" ? "reasoning" : "text";
-      watch.sink.delta(kind, p.delta);
-    }
-  };
-  try {
-    const u = new URL(ocBase + "/event");
-    req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname,
-        method: "GET",
-        headers: { ...(ocAuth ? { Authorization: ocAuth } : {}) },
-        timeout: REQUEST_TIMEOUT,
-      },
-      (r) => {
-        r.setEncoding("utf8");
-        r.on("data", (c) => {
-          buf += c;
-          let i;
-          while ((i = buf.indexOf("\n\n")) !== -1) {
-            const frame = buf.slice(0, i);
-            buf = buf.slice(i + 2);
-            onFrame(frame);
-          }
-        });
-        r.on("end", close);
-        r.on("error", close);
-      }
-    );
-    req.on("error", close);
-    req.on("timeout", close);
-    req.end();
-  } catch {
-    close();
-  }
-  return { close };
+  });
+  send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+  if (r.text) send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: r.text } });
+  send("content_block_stop", { type: "content_block_stop", index: 0 });
+  send("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: r.finish === "length" ? "max_tokens" : "end_turn" },
+    usage: { output_tokens: r.outputTokens },
+  });
+  send("message_stop", { type: "message_stop" });
+  res.end();
 }
 
 // ── HTTP API ────────────────────────────────────────────────────────
@@ -570,8 +515,6 @@ app.get("/v1/models", async (req, res) => {
 
 app.post("/v1/chat/completions", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: { message: "Invalid API key" } });
-  let sink = null;
-  let watch = null;
   try {
     const { model, messages, stream, user: userId } = req.body || {};
     const modelId = String(model || "").replace(/^opencode\//, "");
@@ -584,35 +527,17 @@ app.post("/v1/chat/completions", async (req, res) => {
     const { system, transcript, lastUserText } = messagesToPrompt(messages);
     if (!lastUserText) return res.status(400).json({ error: { message: "No user message in request" } });
     const key = req.headers["x-oc-session"] || userId || null;
-    if (stream) {
-      sink = openaiSink(res, modelId);
-      watch = { sid: null, types: new Map(), sink, conn: null };
-      watch.conn = connectEvents(watch);
-      res.on("close", () => watch.conn.close());
-    }
-    const r = await ask({
-      key, system, modelId, transcript, lastUserText,
-      onSession: (sid) => { if (watch) watch.sid = sid; },
-    });
-    if (r.status !== 200) throw upstreamError(r);
-    const extracted = extractMessage(r.json);
-    if (!extracted.text && !extracted.reasoning && !(sink && sink.opened)) {
-      throw new Error("empty response from opencode");
-    }
-    if (stream) return sink.finish(extracted);
+    const extracted = await ask({ key, system, modelId, transcript, lastUserText });
+    if (!extracted.text && !extracted.reasoning) throw new Error("empty response from opencode");
+    if (stream) return openaiStream(res, modelId, extracted);
     return res.json(openaiResponse(modelId, extracted));
   } catch (e) {
-    if (sink && sink.opened) return sink.fail(e.message);
     return res.status(e.status || 502).json({ error: { message: e.message, type: "upstream_error" } });
-  } finally {
-    watch?.conn?.close();
   }
 });
 
 app.post("/v1/messages", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "Invalid API key" } });
-  let sink = null;
-  let watch = null;
   try {
     const { model, stream, metadata } = req.body || {};
     const modelId = String(model || "").replace(/^opencode\//, "");
@@ -631,36 +556,20 @@ app.post("/v1/messages", async (req, res) => {
       });
     }
     const key = req.headers["x-oc-session"] || metadata?.user_id || null;
-    if (stream) {
-      sink = anthropicSink(res, modelId);
-      watch = { sid: null, types: new Map(), sink, conn: null };
-      watch.conn = connectEvents(watch);
-      res.on("close", () => watch.conn.close());
-    }
-    const r = await ask({
-      key, system, modelId, transcript, lastUserText,
-      onSession: (sid) => { if (watch) watch.sid = sid; },
-    });
-    if (r.status !== 200) throw upstreamError(r);
-    const extracted = extractMessage(r.json);
-    if (!extracted.text && !extracted.reasoning && !(sink && sink.opened)) {
-      throw new Error("empty response from opencode");
-    }
-    if (stream) return sink.finish(extracted);
+    const extracted = await ask({ key, system, modelId, transcript, lastUserText });
+    if (!extracted.text && !extracted.reasoning) throw new Error("empty response from opencode");
+    if (stream) return anthropicStream(res, modelId, extracted);
     return res.json(anthropicResponse(modelId, extracted));
   } catch (e) {
-    if (sink && sink.opened) return sink.fail(e.message);
     return res.status(e.status || 502).json({
       type: "error",
       error: { type: e.status === 429 ? "rate_limit_error" : "upstream_error", message: e.message },
     });
-  } finally {
-    watch?.conn?.close();
   }
 });
 
 app.get("/health", (_req, res) =>
-  res.json({ status: "ok", opencode: ocBase, models: modelCache ? modelCache.length : 0 })
+  res.json({ status: "ok", opencode: ocBase, api: apiVersion, models: modelCache ? modelCache.length : 0 })
 );
 
 // ── start ───────────────────────────────────────────────────────────
